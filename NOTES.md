@@ -8,6 +8,13 @@ Running log of design decisions and the reasoning behind them, so tradeoffs disc
 - v1 has no database, no vector DB, no auth. Evidence store is a flat JSON file (`backend/data/evidence.json`), retrieval is plain cosine similarity in Python. Move to Postgres+pgvector only once this is actually outgrown.
 - Phase 2: richer ingestion pipeline (videos/PDFs/links). Phase 3: OAuth (GitHub/Twitter), identity tiers, privileged content, ping-the-owner notifications.
 
+### Phase 2 addendum: live ingestion from the deployed website, not just local CLI
+
+Ingesting from the site itself (not just running `scripts/ingest.py` by hand) means:
+- A protected `/admin/ingest` API route, sharing the same core chunk/tag/embed logic as `scripts/ingest.py` (pulled into a shared function, e.g. `app/rag/ingestion.py`) rather than duplicating it.
+- Its own, simpler owner-only auth (a single admin token/password), distinct from Phase 3's visitor-tiering OAuth — "is this me, the owner" is a different, easier problem than "who is this visitor."
+- **Likely trigger to move off flat-file `evidence.json` sooner than chunk-count alone would suggest**: most hosting platforms (Railway, Fly.io) run an ephemeral filesystem — a write to local disk from the live server can be wiped on the next redeploy/restart unless a persistent volume is provisioned. Live ingestion from the deployed site is the point this actually bites; local-only CLI ingestion (current v1) never hits it since the disk is genuinely yours.
+
 ## `config.py`
 
 - Centralizes all settings/secrets so the rest of the app never touches `os.environ` directly. Alternative (skip it, call `os.environ.get(...)` inline everywhere) works for tiny projects but scatters env var names and breaks silently on typos as the project grows.
@@ -35,6 +42,16 @@ Running log of design decisions and the reasoning behind them, so tradeoffs disc
 - **Semantic-similarity chunking**: embed each sentence, cut where cosine distance between consecutive sentence embeddings spikes. Uses embeddings you're already paying for, no generation call needed.
 - **Contextual retrieval** (Anthropic's technique): doesn't change chunk boundaries — prepends a short LLM-generated sentence describing where the chunk sits in the document before embedding it (e.g. "This chunk is from the Experience section, describing the Company X role"). Cheap, high-leverage accuracy lever, addable later without restructuring the chunker.
 
+## Evidence tiers — core product feature, not a nice-to-have
+
+Every chunk carries an `evidence_tier`, set manually at ingestion time (never inferred by an LLM, since it's the trust signal the whole product rests on):
+- `public` — independently verifiable by anyone (public repo, published article/video)
+- `attested` — a third party vouches for it (reference, recommendation, co-author confirmation)
+- `self_claimed_with_evidence` — you assert it, backed by an attached artifact (certificate, screenshot, linked code)
+- `self_claimed_without_evidence` — bare assertion, nothing backing it
+
+Defined once as an `EvidenceTier` Literal type in `models.py` (the data-shapes file) and imported into `chunking.py`, rather than duplicating the four strings in both places — avoids drift if a tier is ever renamed/added. Flows purely as passthrough data: `chunking.py` stamps it on each chunk → `evidence.json` stores it → `retrieval.py` doesn't need to know about it (pure passthrough) → `Citation` model carries it → `generation.py` surfaces it per citation → frontend (later) renders a trust badge per citation. Also feeds the system prompt later so the model can hedge phrasing appropriately per tier — a prompting refinement layered on top of, not a replacement for, the structural metadata.
+
 ## `embeddings.py`
 
 - Voyage AI chosen over local `sentence-transformers`: Anthropic's recommended embeddings partner (Claude has no embeddings API of its own), avoids pulling in ~500MB of local ML deps.
@@ -59,3 +76,24 @@ Three composable techniques, not one:
 3. **Recency decay + re-ranking as separate scoring stages** — standard production shape: vector search pulls a broad cheap candidate set (e.g. top 50) → a decay function down-weights stale content (`score = cosine_sim * exp(-λ · age_days)`, tunable per source) → a re-ranker (cross-encoder that scores query+candidate pairs jointly — Voyage has `voyage-rerank-2`) re-scores down to the true top-K sent to the LLM. Access control (does this user have permission to see this chunk's source) gets enforced as another filter at this stage, before the LLM ever sees the content.
 
 For v1 (single-person, mostly resume text): none of this needed yet, but `evidence.json`'s chunk schema should eventually carry a `metadata: {source_type, timestamp, author, url}` dict per chunk so Phase 2 (multiple source types) doesn't require a rewrite — currently deferred, not yet added.
+
+## `generation.py`
+
+- **Structured output via forced tool use, not prompted JSON.** Prompting for JSON in free text is unreliable (markdown fences, preambles can break `json.loads`). Forcing a tool call (`tool_choice={"type": "tool", "name": "submit_answer"}`) constrains generation itself — Anthropic's serving infrastructure masks out any token that would violate the schema at each generation step (constrained/grammar decoding), so the model is mechanically incapable of responding outside the schema shape. **Enforcement happens server-side, on Anthropic's infrastructure** — your code only defines the schema and requests it, then receives an already-parsed dict back.
+- This only guarantees *shape*, not *truth* — the model could still put a fabricated `chunk_id` inside a well-formed `citations` list. Hence the second, independent layer: filtering `parsed["citations"]` down to only IDs present in `chunk_by_id` (the chunks actually sent). Two separate defenses: tool-forcing solves validity, the filter solves truthfulness.
+- **Ungrounded-answer policy: option (b) chosen.** If zero citations survive verification, the model's own `answer` text is discarded entirely and replaced with a fixed `UNGROUNDED_ANSWER` string — never trust free-text claims in a state that couldn't be verified, even if the model's own prose happens to say the honest thing. This doesn't rely on the model reliably self-reporting "no evidence" — it's enforced by code regardless of what text comes back.
+- Evidence block passed to the model includes each chunk's `evidence_tier` inline (`tier: {chunk['evidence_tier']}`) so the model can hedge phrasing per tier later — a prompting refinement on top of the structural metadata already carried through `Citation`.
+
+## `main.py`
+
+- The actual anti-hallucination gate lives here, not in `generation.py`: `/chat` always embeds + retrieves first (cheap), then checks `matches[0][1]` (best match's similarity score) against `settings.grounding_threshold` *before* calling `answer_from_chunks` (which calls Claude). Below threshold → short-circuit to `UNGROUNDED_ANSWER` without ever calling Claude — saves an API call and removes any window where an irrelevant chunk could reach the model.
+- `evidence = load_evidence()` at module level — loaded once at server startup, reused across every request, not re-read from disk per request.
+- `/health` — standard liveness endpoint for deployment platforms/load balancers; also useful to manually confirm `evidence.json` loaded correctly (`chunks_loaded` count).
+- **From this file onward, inline comments explain non-obvious logic directly in the code**, not just here in NOTES.md — the user asked for this as a standing rule (2026-09-17) since the goal is being able to open any file later and understand it without recalling the chat.
+
+### Hybrid search (BM25 + dense) — future extension, not built yet
+
+- BM25 = lexical/sparse retrieval (TF-IDF's successor): scores chunks by exact keyword overlap, weighted by term rarity, normalized for length. Complementary to dense embeddings — embeddings catch semantic/paraphrase matches but can under-weight exact tokens that matter (proper nouns, company names, acronyms, numbers). A query like "when did you work at Acme Corp" is where BM25 nails the literal "Acme Corp" token even if the embedding model doesn't weight that proper noun strongly.
+- Where it plugs in: additive, not a rewrite of `retrieval.py`. New module (e.g. `rag/lexical.py`) with a `bm25_score(query, evidence)` function (likely via `rank_bm25`), index built once at startup — same "compute once, reuse" pattern as the Voyage client and `load_evidence()`.
+- Combine dense + sparse rankings via **Reciprocal Rank Fusion (RRF)**: for each chunk, sum `1 / (k + rank)` across its rank position in both separately-sorted lists (k ≈ 60 is a common constant), sort by that combined score. RRF avoids needing to normalize two incomparable score scales (cosine similarity and BM25 scores aren't on the same range).
+- `cosine_similarity` and `retrieve()` stay unchanged when this is added later — hybrid search bolts on alongside them via a new `hybrid_retrieve()`, not a rewrite.

@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+backend/venv/
+
+# secrets — never commit real credentials
+backend/.env
+
+# personal source documents and the generated evidence store — regenerate by
+# re-running ingestion locally or per-deployment instead of committing them
+backend/sources/
+backend/data/evidence.json
