@@ -84,12 +84,28 @@ For v1 (single-person, mostly resume text): none of this needed yet, but `eviden
 - **Ungrounded-answer policy: option (b) chosen.** If zero citations survive verification, the model's own `answer` text is discarded entirely and replaced with a fixed `UNGROUNDED_ANSWER` string — never trust free-text claims in a state that couldn't be verified, even if the model's own prose happens to say the honest thing. This doesn't rely on the model reliably self-reporting "no evidence" — it's enforced by code regardless of what text comes back.
 - Evidence block passed to the model includes each chunk's `evidence_tier` inline (`tier: {chunk['evidence_tier']}`) so the model can hedge phrasing per tier later — a prompting refinement on top of the structural metadata already carried through `Citation`.
 
+## Request/response logging
+
+Added `logging` (not `print()`) to `main.py`'s `/chat` handler — logs the incoming question, the best retrieval score vs. the grounding threshold, whether the threshold gate passed, and (when it does call Claude) the final `grounded`/citation count. Lands in the same log file uvicorn's own output is already redirected to (`/tmp/portfolio-bot-uvicorn.log` locally). `logging` chosen over `print()` for free timestamps/severity levels and because it's the standard idiomatic choice, not a one-off script habit. This gives ongoing visibility into exactly the kind of thing the manual threshold-calibration script dug up earlier — as automatic, always-on output instead of an ad hoc check.
+
+Also running the dev server with `uvicorn app.main:app --port 8001 --reload` now (not just `--port 8001`) — `--reload` watches source files and restarts automatically on save, which is what caught us out earlier (a stale, pre-`--reload` server process kept serving an old `generation.py` for 15 minutes after edits, which looked like "instructions are being ignored" but was actually "the edits were never loaded at all").
+
 ## `main.py`
 
 - The actual anti-hallucination gate lives here, not in `generation.py`: `/chat` always embeds + retrieves first (cheap), then checks `matches[0][1]` (best match's similarity score) against `settings.grounding_threshold` *before* calling `answer_from_chunks` (which calls Claude). Below threshold → short-circuit to `UNGROUNDED_ANSWER` without ever calling Claude — saves an API call and removes any window where an irrelevant chunk could reach the model.
 - `evidence = load_evidence()` at module level — loaded once at server startup, reused across every request, not re-read from disk per request.
 - `/health` — standard liveness endpoint for deployment platforms/load balancers; also useful to manually confirm `evidence.json` loaded correctly (`chunks_loaded` count).
 - **From this file onward, inline comments explain non-obvious logic directly in the code**, not just here in NOTES.md — the user asked for this as a standing rule (2026-09-17) since the goal is being able to open any file later and understand it without recalling the chat.
+
+### Re-embedding on every ingest — future optimization, not built yet
+
+`ingest.py` currently re-chunks and re-embeds a file's *entire* content on every run, with no check for "have I already embedded this exact content." Fine at resume-scale (cheap, instant); becomes real waste once ingesting long video transcripts or re-running ingestion frequently during iteration.
+
+Fix: hash file content before chunking, compare against the hash from that source's last ingestion (stored alongside chunks or in a small manifest), skip re-embedding if unchanged. A chunk-level (not whole-file) version of this would need `chunk_id` to become content-based (`sha1(chunk_text)`) rather than position-based (`sha1(f"{source}:{start}")`) as it is now — position-based IDs shift for every chunk after an edit even when most content is unchanged, so they can't cleanly detect "this specific chunk is unchanged."
+
+### Error handling for upstream API failures — future work, not built yet
+
+`main.py`'s `/chat` currently has no try/except around the Claude or Voyage calls — a billing issue, rate limit, or network blip on either upstream API crashes the request with a raw 500 error instead of a graceful degraded response. Fine for local testing; worth wrapping before this is live for real visitors, so an upstream outage shows a sensible "temporarily unavailable" message instead of a stack trace.
 
 ### Hybrid search (BM25 + dense) — future extension, not built yet
 
